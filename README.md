@@ -1,2 +1,1 @@
-# EnshroudedServerManagement
-Enshrouded Server Management for Dedicated Server
+# Enshrouded Server Management for Dedicated Server
