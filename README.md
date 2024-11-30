@@ -4,4 +4,4 @@ Executable can be found in [Releases](https://github.com/sibercat/Enshrouded-Ser
 
 ===========================================================================
 
-![alt text](https://cdn.discordapp.com/attachments/1219454507138809896/1308861732202221568/image.png?ex=673f7bfa&is=673e2a7a&hm=8c30e52c229d30228f7c12a1211da5eb3923cbe4e5bdc6e25ad6471788dc1d21&)
+![alt text](https://cdn.discordapp.com/attachments/1140060445726756924/1312430819653976125/image.png?ex=674c77f3&is=674b2673&hm=9300521ee308af24fdb402c85212b32c2088e573fff07b098d6c2d8d144d3b2b&)
