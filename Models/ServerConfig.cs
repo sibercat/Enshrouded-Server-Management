@@ -114,10 +114,10 @@ public class ServerConfig
     // User groups (Admin, Friend, Guest, Visitor)
     public List<UserGroup> UserGroups { get; set; } = new()
     {
-        new() { Name = "Admin",   Password = "Admin6cnHwt-D",   CanKickBan = true,  CanAccessInventories = true,  CanEditWorld = true,  CanEditBase = true,  CanExtendBase = true,  ReservedSlots = 0 },
-        new() { Name = "Friend",  Password = "Friend8p[O-PxS",  CanKickBan = false, CanAccessInventories = true,  CanEditWorld = true,  CanEditBase = true,  CanExtendBase = false, ReservedSlots = 0 },
-        new() { Name = "Guest",   Password = "Guest8AUvMEaA",   CanKickBan = false, CanAccessInventories = false, CanEditWorld = true,  CanEditBase = false, CanExtendBase = false, ReservedSlots = 0 },
-        new() { Name = "Visitor", Password = "Visitor!XXXXXXX", CanKickBan = false, CanAccessInventories = false, CanEditWorld = false, CanEditBase = false, CanExtendBase = false, ReservedSlots = 0 }
+        new() { Name = "Admin",   Password = "", CanKickBan = true,  CanAccessInventories = true,  CanEditWorld = true,  CanEditBase = true,  CanExtendBase = true,  ReservedSlots = 0 },
+        new() { Name = "Friend",  Password = "", CanKickBan = false, CanAccessInventories = true,  CanEditWorld = true,  CanEditBase = true,  CanExtendBase = false, ReservedSlots = 0 },
+        new() { Name = "Guest",   Password = "", CanKickBan = false, CanAccessInventories = false, CanEditWorld = true,  CanEditBase = false, CanExtendBase = false, ReservedSlots = 0 },
+        new() { Name = "Visitor", Password = "", CanKickBan = false, CanAccessInventories = false, CanEditWorld = false, CanEditBase = false, CanExtendBase = false, ReservedSlots = 0 }
     };
 
     // Server management
