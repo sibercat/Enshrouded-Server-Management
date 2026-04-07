@@ -1,7 +1,7 @@
 <Window x:Class="EnshroudedServerManager.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Enshrouded Server Manager v1.0.0" Icon="app.ico"
+        Title="Enshrouded Server Manager v1.0.0"
         MinWidth="900" MinHeight="700" Width="1000" Height="750"
         Closing="Window_Closing">
 
