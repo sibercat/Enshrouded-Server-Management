@@ -1,3 +1,7 @@
+![Dashboard](https://raw.githubusercontent.com/sibercat/Enshrouded-Server-Management/refs/heads/main/preview.png)
+
+Executable can be found here [Releases](https://github.com/sibercat/Enshrouded-Server-Management/releases)
+
 # Enshrouded Server Manager
 
 A Windows GUI application for managing an Enshrouded dedicated server.
