@@ -13,8 +13,6 @@ A Windows GUI application for managing an Enshrouded dedicated server.
   - Download: https://aka.ms/vs/17/release/vc_redist.x64.exe
   - Already present on most Windows 10/11 desktops — commonly missing on Windows Server
 
-> The manager will detect a missing Visual C++ Redistributable on startup and offer to open the download page.
-
 ## Building from Source
 
 ```
