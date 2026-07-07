@@ -5,6 +5,8 @@ namespace EnshroudedServerManager.Core;
 
 public static class DiscordService
 {
+    private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(15) };
+
     /// <summary>
     /// Sends a message to the configured Discord webhook. No-ops if URL is blank.
     /// </summary>
@@ -15,9 +17,8 @@ public static class DiscordService
         try
         {
             var payload = JsonSerializer.Serialize(new { content = message });
-            using var http    = new HttpClient();
             using var content = new StringContent(payload, Encoding.UTF8, "application/json");
-            var response = await http.PostAsync(webhookUrl, content);
+            var response = await Http.PostAsync(webhookUrl, content);
 
             if (!response.IsSuccessStatusCode)
                 AppLogger.Warning($"Discord webhook returned {(int)response.StatusCode}: {response.ReasonPhrase}");

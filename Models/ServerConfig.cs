@@ -84,15 +84,11 @@ public class AutoBackupConfig
 // ── Main config ────────────────────────────────────────────────────────────────
 public class ServerConfig
 {
-    private static string RootDir =>
-        Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "EnshroudedServer");
-
     // Paths
     public string ServerDir    { get; set; } = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "EnshroudedServer", "server");
     public string SteamcmdDir  { get; set; } = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "EnshroudedServer", "steamcmd");
     public string BackupDir    { get; set; } = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "EnshroudedServer", "backups");
     public string AppId        { get; set; } = "2278520";
-    public int    MaxBackups   { get; set; } = 5;
 
     // Server identity
     public string ServerName   { get; set; } = "My Enshrouded Server";
@@ -129,16 +125,9 @@ public class ServerConfig
     public AutoBackupConfig AutoBackup  { get; set; } = new();
 
     // Launch args
-    public bool   PvpEnabled     { get; set; } = false;
-    public int    MaxFps         { get; set; } = 60;
-    public int    TickRate       { get; set; } = 64;
     public string StartupParams  { get; set; } = "";
 
     // Discord
     public string DiscordStatusWebhookUrl { get; set; } = "";
     public string DiscordCrashWebhookUrl  { get; set; } = "";
-
-    // App
-    public bool   AllowCommands  { get; set; } = true;
-    public string LogLevel       { get; set; } = "info";
 }

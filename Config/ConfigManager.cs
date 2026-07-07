@@ -82,6 +82,23 @@ public class ConfigManager
             var serverJsonPath = Path.Combine(serverDir, "enshrouded_server.json");
             var gs = Config.GameSettings;
 
+            // The server exits immediately on startup if any user group has an
+            // empty password — generate one for each blank group and persist it
+            // so the user can read it back in Settings → User Groups.
+            bool generated = false;
+            foreach (var group in Config.UserGroups)
+            {
+                if (string.IsNullOrWhiteSpace(group.Password))
+                {
+                    group.Password = GeneratePassword(group.Name);
+                    generated = true;
+                    AppLogger.Warning($"User group '{group.Name}' had an empty password — generated '{group.Password}'. " +
+                                      "(The server refuses to start when a group password is blank.)");
+                }
+            }
+            if (generated)
+                Save();
+
             // Build the gameSettings block — convert minute values to nanoseconds
             var gameSettingsObj = new
             {
@@ -127,38 +144,32 @@ public class ConfigManager
             // Serialize user groups using camelCase
             var userGroupsNode = JsonSerializer.SerializeToNode(Config.UserGroups, GameJsonOptions)!;
 
-            // Build top-level server JSON
-            var serverObj = new JsonObject
-            {
-                ["name"]               = Config.ServerName,
-                ["saveDirectory"]      = "./savegame",
-                ["logDirectory"]       = "./logs",
-                ["ip"]                 = Config.ServerIp,
-                ["queryPort"]          = Config.QueryPort,
-                ["slotCount"]          = Config.MaxPlayers,
-                ["tags"]               = JsonSerializer.SerializeToNode(Config.Tags),
-                ["voiceChatMode"]      = Config.VoiceChatMode,
-                ["enableVoiceChat"]    = Config.EnableVoiceChat,
-                ["enableTextChat"]     = Config.EnableTextChat,
-                ["gameSettingsPreset"] = Config.GameSettingsPreset,
-                ["gameSettings"]       = JsonSerializer.SerializeToNode(gameSettingsObj),
-                ["userGroups"]         = userGroupsNode
-            };
-
-            // Preserve existing bans list if present
+            // Start from the existing file so keys owned by the server
+            // (bannedAccounts, anything added in future updates) survive our rewrite.
+            var serverObj = new JsonObject();
             if (File.Exists(serverJsonPath))
             {
                 try
                 {
-                    var existing = JsonNode.Parse(File.ReadAllText(serverJsonPath));
-                    if (existing?["bans"] is JsonNode bans)
-                        serverObj["bans"] = bans.DeepClone();
+                    if (JsonNode.Parse(File.ReadAllText(serverJsonPath)) is JsonObject existing)
+                        serverObj = existing;
                 }
                 catch { }
             }
 
-            if (!serverObj.ContainsKey("bans"))
-                serverObj["bans"] = new JsonArray();
+            serverObj["name"]               = Config.ServerName;
+            serverObj["saveDirectory"]      = "./savegame";
+            serverObj["logDirectory"]       = "./logs";
+            serverObj["ip"]                 = Config.ServerIp;
+            serverObj["queryPort"]          = Config.QueryPort;
+            serverObj["slotCount"]          = Config.MaxPlayers;
+            serverObj["tags"]               = JsonSerializer.SerializeToNode(Config.Tags);
+            serverObj["voiceChatMode"]      = Config.VoiceChatMode;
+            serverObj["enableVoiceChat"]    = Config.EnableVoiceChat;
+            serverObj["enableTextChat"]     = Config.EnableTextChat;
+            serverObj["gameSettingsPreset"] = Config.GameSettingsPreset;
+            serverObj["gameSettings"]       = JsonSerializer.SerializeToNode(gameSettingsObj);
+            serverObj["userGroups"]         = userGroupsNode;
 
             File.WriteAllText(serverJsonPath, serverObj.ToJsonString(GameJsonOptions));
             AppLogger.Info($"Updated {serverJsonPath}");
@@ -169,5 +180,15 @@ public class ConfigManager
             AppLogger.Error($"Failed to update server JSON: {ex.Message}");
             return false;
         }
+    }
+
+    // Same shape as the passwords the server itself generates: GroupName + random suffix
+    private static string GeneratePassword(string groupName)
+    {
+        const string chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
+        var suffix = new char[8];
+        for (int i = 0; i < suffix.Length; i++)
+            suffix[i] = chars[System.Security.Cryptography.RandomNumberGenerator.GetInt32(chars.Length)];
+        return groupName + new string(suffix);
     }
 }

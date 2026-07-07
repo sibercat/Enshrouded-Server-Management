@@ -8,8 +8,8 @@ namespace EnshroudedServerManager.Core;
 public class ServerManager
 {
     // ── Constants ─────────────────────────────────────────────────────────────
-    public const string Version   = "1.0.0";
-    public const string BuildDate = "2026-04-06";
+    public const string Version   = "1.0.1";
+    public const string BuildDate = "2026-07-06";
     private const string ProcessName = "enshrouded_server";
 
     // ── State ─────────────────────────────────────────────────────────────────
@@ -28,10 +28,15 @@ public class ServerManager
     private bool _intentionalStop = false;
     public bool WasCrash { get; private set; } = false;
 
+    // Crash auto-restart limiter — give up after repeated rapid crashes
+    private const int MaxConsecutiveCrashRestarts = 3;
+    private static readonly TimeSpan CrashCounterResetWindow = TimeSpan.FromMinutes(15);
+    private int _crashRestartAttempts;
+    private DateTime _lastCrashAt = DateTime.MinValue;
+
     // CPU tracking
     private DateTime  _lastCpuSample   = DateTime.MinValue;
     private TimeSpan  _lastCpuTime     = TimeSpan.Zero;
-    private double    _lastCpuPercent  = 0;
 
     // ── Public surface ────────────────────────────────────────────────────────
     public ServerConfig Config => _configManager.Config;
@@ -112,14 +117,20 @@ public class ServerManager
         _backupManager?.Stop();
         _restartManager?.Stop();
 
-        // Graceful terminate first
+        // Graceful terminate first. If we don't hold a handle (server was started
+        // before this app, or the app was relaunched), attach to the running
+        // process by name so Stop is still graceful rather than an instant kill.
+        var target = _serverProcess is { HasExited: false }
+            ? _serverProcess
+            : Process.GetProcessesByName(ProcessName).FirstOrDefault();
+
         bool stopped = false;
-        if (_serverProcess is { HasExited: false })
+        if (target is { HasExited: false })
         {
             try
             {
-                _serverProcess.CloseMainWindow();
-                stopped = await WaitForExitAsync(_serverProcess, TimeSpan.FromSeconds(10));
+                target.CloseMainWindow();
+                stopped = await WaitForExitAsync(target, TimeSpan.FromSeconds(10));
             }
             catch { }
         }
@@ -172,7 +183,11 @@ public class ServerManager
     public async Task<bool> RestartAsync()
     {
         AppLogger.Info("Restarting Enshrouded server...");
-        await StopAsync();
+        if (!await StopAsync() && IsRunning())
+        {
+            AppLogger.Error("Restart aborted — server could not be stopped.");
+            return false;
+        }
         await Task.Delay(3000);
         return await StartAsync();
     }
@@ -265,13 +280,15 @@ public class ServerManager
         _restartManager?.Shutdown();
         _backupManager?.Stop();
 
-        // Stop the server so savegame files are released before we back them up
+        // Stop the server so savegame files are released before we back them up.
+        // A successful StopAsync already runs the BackupOnShutdown backup, so
+        // only ask ShutdownAsync to back up when that didn't happen — and never
+        // while the server is still running (live savegame files).
+        bool stoppedAndBackedUp = false;
         if (IsRunning())
-            await StopAsync();
+            stoppedAndBackedUp = await StopAsync();
 
-        // Backup AFTER server is stopped — always use the property (creates lazily if null)
-        // so BackupOnShutdown works even when AutoBackup.Enabled is false
-        await BackupManager.ShutdownAsync();
+        await BackupManager.ShutdownAsync(performBackup: !stoppedAndBackedUp && !IsRunning());
 
         AppLogger.Info("Shutdown complete.");
     }
@@ -301,7 +318,6 @@ public class ServerManager
 
             _lastCpuSample  = now;
             _lastCpuTime    = cpuTime;
-            _lastCpuPercent = cpuPct;
 
             return (cpuPct, Math.Round(memMb, 1));
         }
@@ -322,8 +338,26 @@ public class ServerManager
 
         if (Config.AutoRestartOnCrash)
         {
+            // Rapid crash loop protection: after 3 crashes in quick succession,
+            // stop restarting — something is wrong that a restart won't fix.
+            var now = DateTime.Now;
+            if (now - _lastCrashAt > CrashCounterResetWindow)
+                _crashRestartAttempts = 0;
+            _lastCrashAt = now;
+
+            if (++_crashRestartAttempts > MaxConsecutiveCrashRestarts)
+            {
+                AppLogger.Error($"Server crashed {MaxConsecutiveCrashRestarts} times within " +
+                                $"{CrashCounterResetWindow.TotalMinutes:F0} minutes — giving up on automatic restarts. " +
+                                "Check the server logs, then start it manually.");
+                await DiscordService.SendAsync(Config.DiscordStatusWebhookUrl,
+                    $"🛑 **{Config.ServerName}** — Crashed repeatedly; automatic restarts suspended.");
+                return;
+            }
+
             var delay = Math.Max(1, Config.CrashRestartDelaySeconds);
-            AppLogger.Info($"Auto Restart on Crash enabled — restarting in {delay} second(s)...");
+            AppLogger.Info($"Auto Restart on Crash enabled — restarting in {delay} second(s)... " +
+                           $"(attempt {_crashRestartAttempts}/{MaxConsecutiveCrashRestarts})");
             await DiscordService.SendAsync(Config.DiscordStatusWebhookUrl,
                 $"🔄 **{Config.ServerName}** — Attempting automatic restart after crash in {delay}s...");
 

@@ -14,9 +14,16 @@ public class RestartManager
         _server = server;
     }
 
+    private int _scheduledIntervalHours;
+
     public void Start()
     {
-        if (_loopTask is { IsCompleted: false })
+        // A loop whose token is already cancelled counts as stopped even if the
+        // task hasn't unwound yet — this happens when the loop itself triggers a
+        // restart (RestartAsync → StopAsync cancels us → StartAsync calls Start()
+        // while the old loop is still on the stack). Spin up a fresh loop; the
+        // old one exits on its cancelled token.
+        if (_loopTask is { IsCompleted: false } && _cts is { IsCancellationRequested: false })
         {
             AppLogger.Info("Restart manager already running.");
             return;
@@ -24,13 +31,15 @@ public class RestartManager
 
         ScheduleNext();
         _cts = new CancellationTokenSource();
-        _loopTask = Task.Run(() => RunLoopAsync(_cts.Token));
+        var token = _cts.Token;
+        _loopTask = Task.Run(() => RunLoopAsync(token));
         AppLogger.Info("Restart manager started.");
     }
 
     public void Stop()
     {
         _cts?.Cancel();
+        NextRestart = null;
         AppLogger.Info("Restart manager stop requested.");
     }
 
@@ -38,15 +47,19 @@ public class RestartManager
     {
         if (_server.Config.AutoRestart)
         {
-            if (_loopTask is null or { IsCompleted: true })
-                Start();
-            else
-                ScheduleNext();
+            if (_loopTask is null or { IsCompleted: true } || _cts is null or { IsCancellationRequested: true })
+            {
+                if (_server.IsRunning())
+                    Start();
+            }
+            else if (_server.Config.RestartInterval != _scheduledIntervalHours)
+            {
+                ScheduleNext(); // interval changed — recompute; otherwise keep the current schedule
+            }
         }
         else
         {
             Stop();
-            NextRestart = null;
         }
     }
 
@@ -54,7 +67,8 @@ public class RestartManager
 
     private void ScheduleNext()
     {
-        NextRestart = DateTime.Now.AddHours(_server.Config.RestartInterval);
+        _scheduledIntervalHours = _server.Config.RestartInterval;
+        NextRestart = DateTime.Now.AddHours(_scheduledIntervalHours);
         AppLogger.Info($"Next restart scheduled: {NextRestart:yyyy-MM-dd HH:mm:ss}");
     }
 
@@ -67,6 +81,7 @@ public class RestartManager
                 if (!_server.IsRunning())
                 {
                     AppLogger.Info("Server stopped — restart manager exiting.");
+                    NextRestart = null;
                     break;
                 }
 
@@ -86,6 +101,11 @@ public class RestartManager
 
                     AppLogger.Info("Executing scheduled restart...");
                     bool ok = await _server.RestartAsync();
+
+                    // RestartAsync cycles this manager (StopAsync cancels our token,
+                    // StartAsync spawns a replacement loop that owns the schedule now).
+                    if (ct.IsCancellationRequested) break;
+
                     if (ok)
                     {
                         ScheduleNext();

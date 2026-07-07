@@ -23,6 +23,7 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        Title = $"Enshrouded Server Manager v{ServerManager.Version}";
 
         var rootDir    = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "EnshroudedServer");
         Directory.CreateDirectory(rootDir);
@@ -83,11 +84,12 @@ public partial class MainWindow : Window
     // ── Window closing ────────────────────────────────────────────────────────
     private async void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)
     {
-        if (_shutdownInProgress) return;
-        _statusTimer.Stop();
-        _restartTimer.Stop();
+        if (_shutdownInProgress) return; // second pass triggered by Application.Shutdown()
 
-        if (_server.IsRunning())
+        bool running = _server.IsRunning();
+        bool leaveServerRunning = false;
+
+        if (running)
         {
             var result = MessageBox.Show(
                 "The server is still running. Stop it before closing?",
@@ -96,27 +98,43 @@ public partial class MainWindow : Window
             if (result == MessageBoxResult.Cancel)
             {
                 e.Cancel = true;
-                _statusTimer.Start();
-                _restartTimer.Start();
                 return;
             }
 
-            if (result == MessageBoxResult.Yes)
-            {
-                e.Cancel = true;
-                _shutdownInProgress = true;
-                IsEnabled = false;
-                AppendConsole("Shutting down...");
-                await _server.ShutdownAsync();
-                AppLogger.Shutdown();
-                Application.Current.Shutdown();
-                return;
-            }
+            leaveServerRunning = result == MessageBoxResult.No;
         }
 
-        // Server is not running (or user chose No) — still run shutdown backup if enabled
-        await _server.BackupManager.ShutdownAsync();
+        // Always cancel this close and re-close via Application.Shutdown() once the
+        // async work is done — otherwise WPF tears the process down at the first
+        // await and can kill a shutdown backup mid-write.
+        e.Cancel = true;
+        _shutdownInProgress = true;
+        _statusTimer.Stop();
+        _restartTimer.Stop();
+        IsEnabled = false;
+
+        try
+        {
+            if (running && !leaveServerRunning)
+            {
+                AppendConsole("Shutting down...");
+                await _server.ShutdownAsync();
+            }
+            else if (!running)
+            {
+                // Server already stopped — run the shutdown backup if enabled
+                await _server.BackupManager.ShutdownAsync();
+            }
+            // else: leaving the server running — skip the backup, its savegame
+            // files are in use and the archive could come out corrupt
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Error($"Error during shutdown: {ex.Message}");
+        }
+
         AppLogger.Shutdown();
+        Application.Current.Shutdown();
     }
 
     // ── Buttons ───────────────────────────────────────────────────────────────
@@ -322,6 +340,8 @@ public partial class MainWindow : Window
         {
             bool ok = await op();
             AppendConsole(ok ? $"'{name}' completed." : $"'{name}' failed — check logs.");
+            if (ok && name is "start" or "restart")
+                RefreshUserGroupFields(); // starting may auto-generate blank group passwords
             if (!ok)
                 MessageBox.Show($"Failed to {name} server.", "Operation Failed",
                     MessageBoxButton.OK, MessageBoxImage.Warning);
@@ -404,10 +424,6 @@ public partial class MainWindow : Window
         MaxPlayersInput.Text    = c.MaxPlayers.ToString();
         StartupParamsInput.Text = c.StartupParams;
 
-        PvpEnabledCheck.IsChecked     = c.PvpEnabled;
-        MaxFpsInput.Text              = c.MaxFps.ToString();
-        TickRateInput.Text            = c.TickRate.ToString();
-
         EnableVoiceChatCheck.IsChecked = c.EnableVoiceChat;
         EnableTextChatCheck.IsChecked  = c.EnableTextChat;
         SetCombo(VoiceChatModeCombo, c.VoiceChatMode);
@@ -428,10 +444,7 @@ public partial class MainWindow : Window
         PopulateGameplayTab();
 
         // ── User Groups tab ──
-        PopulateUserGroup(c, "Admin",   AdminPassInput,   AdminReservedInput,   AdminCanKickBan,   AdminCanAccessInventories,   AdminCanEditWorld,   AdminCanEditBase,   AdminCanExtendBase);
-        PopulateUserGroup(c, "Friend",  FriendPassInput,  FriendReservedInput,  FriendCanKickBan,  FriendCanAccessInventories,  FriendCanEditWorld,  FriendCanEditBase,  FriendCanExtendBase);
-        PopulateUserGroup(c, "Guest",   GuestPassInput,   GuestReservedInput,   GuestCanKickBan,   GuestCanAccessInventories,   GuestCanEditWorld,   GuestCanEditBase,   GuestCanExtendBase);
-        PopulateUserGroup(c, "Visitor", VisitorPassInput, VisitorReservedInput, VisitorCanKickBan, VisitorCanAccessInventories, VisitorCanEditWorld, VisitorCanEditBase, VisitorCanExtendBase);
+        RefreshUserGroupFields();
 
         // ── Backup tab ──
         AutoBackupCheck.IsChecked       = c.AutoBackup.Enabled;
@@ -494,6 +507,15 @@ public partial class MainWindow : Window
         SetCombo(CurseModifierCombo, gs.CurseModifier);
     }
 
+    private void RefreshUserGroupFields()
+    {
+        var c = _server.Config;
+        PopulateUserGroup(c, "Admin",   AdminPassInput,   AdminReservedInput,   AdminCanKickBan,   AdminCanAccessInventories,   AdminCanEditWorld,   AdminCanEditBase,   AdminCanExtendBase);
+        PopulateUserGroup(c, "Friend",  FriendPassInput,  FriendReservedInput,  FriendCanKickBan,  FriendCanAccessInventories,  FriendCanEditWorld,  FriendCanEditBase,  FriendCanExtendBase);
+        PopulateUserGroup(c, "Guest",   GuestPassInput,   GuestReservedInput,   GuestCanKickBan,   GuestCanAccessInventories,   GuestCanEditWorld,   GuestCanEditBase,   GuestCanExtendBase);
+        PopulateUserGroup(c, "Visitor", VisitorPassInput, VisitorReservedInput, VisitorCanKickBan, VisitorCanAccessInventories, VisitorCanEditWorld, VisitorCanEditBase, VisitorCanExtendBase);
+    }
+
     private static void PopulateUserGroup(ServerConfig c, string name,
         TextBox passBox, TextBox reservedBox,
         CheckBox kickBan, CheckBox inventory, CheckBox editWorld, CheckBox editBase, CheckBox extendBase)
@@ -520,14 +542,10 @@ public partial class MainWindow : Window
             // ── Server tab ──
             c.ServerName   = ServerNameInput.Text.Trim();
             c.ServerIp     = ServerIpInput.Text.Trim();
-            c.GamePort     = ParseInt(GamePortInput.Text,   c.GamePort);
-            c.QueryPort    = ParseInt(QueryPortInput.Text,  c.QueryPort);
-            c.MaxPlayers   = ParseInt(MaxPlayersInput.Text, c.MaxPlayers);
+            c.GamePort     = ParseInt(GamePortInput.Text,   c.GamePort,   1, 65535);
+            c.QueryPort    = ParseInt(QueryPortInput.Text,  c.QueryPort,  1, 65535);
+            c.MaxPlayers   = ParseInt(MaxPlayersInput.Text, c.MaxPlayers, 1, 16);
             c.StartupParams = StartupParamsInput.Text.Trim();
-
-            c.PvpEnabled     = PvpEnabledCheck.IsChecked == true;
-            c.MaxFps         = ParseInt(MaxFpsInput.Text,   c.MaxFps);
-            c.TickRate       = ParseInt(TickRateInput.Text,  c.TickRate);
 
             c.EnableVoiceChat = EnableVoiceChatCheck.IsChecked == true;
             c.EnableTextChat  = EnableTextChatCheck.IsChecked  == true;
@@ -539,58 +557,59 @@ public partial class MainWindow : Window
                 .ToList();
 
             c.AutoRestart              = AutoRestartCheck.IsChecked == true;
-            c.RestartInterval          = ParseInt(RestartIntervalInput.Text,    c.RestartInterval);
-            c.RestartWarningMinutes    = ParseInt(RestartWarningInput.Text,     c.RestartWarningMinutes);
+            c.RestartInterval          = ParseInt(RestartIntervalInput.Text,    c.RestartInterval,       1, 720);
+            c.RestartWarningMinutes    = ParseInt(RestartWarningInput.Text,     c.RestartWarningMinutes, 0, 120);
             c.AutoRestartOnCrash       = AutoRestartOnCrashCheck.IsChecked == true;
-            c.CrashRestartDelaySeconds = ParseInt(CrashRestartDelayInput.Text,  c.CrashRestartDelaySeconds);
+            c.CrashRestartDelaySeconds = ParseInt(CrashRestartDelayInput.Text,  c.CrashRestartDelaySeconds, 1, 3600);
             c.DiscordStatusWebhookUrl = DiscordStatusWebhookInput.Text.Trim();
             c.DiscordCrashWebhookUrl  = DiscordCrashWebhookInput.Text.Trim();
 
             // ── Gameplay tab ──
             c.GameSettingsPreset = (GamePresetCombo.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? c.GameSettingsPreset;
 
-            gs.PlayerHealthFactor      = ParseDouble(PlayerHealthInput.Text,   gs.PlayerHealthFactor);
-            gs.PlayerManaFactor        = ParseDouble(PlayerManaInput.Text,     gs.PlayerManaFactor);
-            gs.PlayerStaminaFactor     = ParseDouble(PlayerStaminaInput.Text,  gs.PlayerStaminaFactor);
-            gs.PlayerBodyHeatFactor    = ParseDouble(PlayerBodyHeatInput.Text, gs.PlayerBodyHeatFactor);
-            gs.PlayerDivingTimeFactor  = ParseDouble(PlayerDivingInput.Text,   gs.PlayerDivingTimeFactor);
+            // Ranges below come from enshrouded_server_readme.txt (v0.9.0.0)
+            gs.PlayerHealthFactor      = ParseDouble(PlayerHealthInput.Text,   gs.PlayerHealthFactor,     0.25, 4);
+            gs.PlayerManaFactor        = ParseDouble(PlayerManaInput.Text,     gs.PlayerManaFactor,       0.25, 4);
+            gs.PlayerStaminaFactor     = ParseDouble(PlayerStaminaInput.Text,  gs.PlayerStaminaFactor,    0.25, 4);
+            gs.PlayerBodyHeatFactor    = ParseDouble(PlayerBodyHeatInput.Text, gs.PlayerBodyHeatFactor,   0.5,  2);
+            gs.PlayerDivingTimeFactor  = ParseDouble(PlayerDivingInput.Text,   gs.PlayerDivingTimeFactor, 0.5,  2);
 
             gs.EnableDurability        = EnableDurabilityCheck.IsChecked == true;
             gs.EnableStarvingDebuff    = EnableStarvingCheck.IsChecked   == true;
-            gs.FoodBuffDurationFactor  = ParseDouble(FoodBuffDurationInput.Text, gs.FoodBuffDurationFactor);
-            gs.HungerToStarvingMinutes = ParseInt(HungerToStarvingInput.Text,    gs.HungerToStarvingMinutes);
-            gs.ShroudTimeFactor        = ParseDouble(ShroudTimeInput.Text,       gs.ShroudTimeFactor);
+            gs.FoodBuffDurationFactor  = ParseDouble(FoodBuffDurationInput.Text, gs.FoodBuffDurationFactor, 0.5, 2);
+            gs.HungerToStarvingMinutes = ParseInt(HungerToStarvingInput.Text,    gs.HungerToStarvingMinutes, 5, 20);
+            gs.ShroudTimeFactor        = ParseDouble(ShroudTimeInput.Text,       gs.ShroudTimeFactor,        0.5, 2);
             gs.TombstoneMode           = ComboValue(TombstoneModeCombo,          gs.TombstoneMode);
 
             gs.WeatherFrequency        = ComboValue(WeatherFreqCombo,       gs.WeatherFrequency);
             gs.FishingDifficulty       = ComboValue(FishingDifficultyCombo, gs.FishingDifficulty);
             gs.EnableGliderTurbulences = EnableGliderCheck.IsChecked == true;
-            gs.MiningDamageFactor      = ParseDouble(MiningDamageInput.Text, gs.MiningDamageFactor);
-            gs.PlantGrowthSpeedFactor  = ParseDouble(PlantGrowthInput.Text,  gs.PlantGrowthSpeedFactor);
-            gs.DayLengthMinutes        = ParseInt(DayLengthInput.Text,   gs.DayLengthMinutes);
-            gs.NightLengthMinutes      = ParseInt(NightLengthInput.Text,  gs.NightLengthMinutes);
+            gs.MiningDamageFactor      = ParseDouble(MiningDamageInput.Text, gs.MiningDamageFactor,     0.5,  2);
+            gs.PlantGrowthSpeedFactor  = ParseDouble(PlantGrowthInput.Text,  gs.PlantGrowthSpeedFactor, 0.25, 2);
+            gs.DayLengthMinutes        = ParseInt(DayLengthInput.Text,   gs.DayLengthMinutes,   2, 60);
+            gs.NightLengthMinutes      = ParseInt(NightLengthInput.Text, gs.NightLengthMinutes, 2, 60);
 
-            gs.ResourceDropStackAmountFactor = ParseDouble(ResourceDropInput.Text,  gs.ResourceDropStackAmountFactor);
-            gs.FactoryProductionSpeedFactor  = ParseDouble(FactorySpeedInput.Text,  gs.FactoryProductionSpeedFactor);
-            gs.PerkUpgradeRecyclingFactor    = ParseDouble(PerkRecyclingInput.Text,  gs.PerkUpgradeRecyclingFactor);
-            gs.PerkCostFactor                = ParseDouble(PerkCostInput.Text,       gs.PerkCostFactor);
+            gs.ResourceDropStackAmountFactor = ParseDouble(ResourceDropInput.Text,  gs.ResourceDropStackAmountFactor, 0.25, 2);
+            gs.FactoryProductionSpeedFactor  = ParseDouble(FactorySpeedInput.Text,  gs.FactoryProductionSpeedFactor,  0.25, 2);
+            gs.PerkUpgradeRecyclingFactor    = ParseDouble(PerkRecyclingInput.Text, gs.PerkUpgradeRecyclingFactor,    0,    1);
+            gs.PerkCostFactor                = ParseDouble(PerkCostInput.Text,      gs.PerkCostFactor,                0.25, 2);
 
-            gs.ExperienceCombatFactor             = ParseDouble(CombatXpInput.Text,  gs.ExperienceCombatFactor);
-            gs.ExperienceMiningFactor             = ParseDouble(MiningXpInput.Text,  gs.ExperienceMiningFactor);
-            gs.ExperienceExplorationQuestsFactor  = ParseDouble(ExploreXpInput.Text, gs.ExperienceExplorationQuestsFactor);
+            gs.ExperienceCombatFactor             = ParseDouble(CombatXpInput.Text,  gs.ExperienceCombatFactor,            0.25, 2);
+            gs.ExperienceMiningFactor             = ParseDouble(MiningXpInput.Text,  gs.ExperienceMiningFactor,            0,    2);
+            gs.ExperienceExplorationQuestsFactor  = ParseDouble(ExploreXpInput.Text, gs.ExperienceExplorationQuestsFactor, 0.25, 2);
 
             gs.RandomSpawnerAmount      = ComboValue(EnemyAmountCombo, gs.RandomSpawnerAmount);
             gs.AggroPoolAmount          = ComboValue(AggroPoolCombo,   gs.AggroPoolAmount);
-            gs.EnemyDamageFactor        = ParseDouble(EnemyDamageInput.Text,     gs.EnemyDamageFactor);
-            gs.EnemyHealthFactor        = ParseDouble(EnemyHealthInput.Text,     gs.EnemyHealthFactor);
-            gs.EnemyStaminaFactor       = ParseDouble(EnemyStaminaInput.Text,    gs.EnemyStaminaFactor);
-            gs.EnemyPerceptionRangeFactor = ParseDouble(EnemyPerceptionInput.Text, gs.EnemyPerceptionRangeFactor);
-            gs.ThreatBonus              = ParseDouble(ThreatBonusInput.Text,     gs.ThreatBonus);
+            gs.EnemyDamageFactor        = ParseDouble(EnemyDamageInput.Text,      gs.EnemyDamageFactor,          0.25, 5);
+            gs.EnemyHealthFactor        = ParseDouble(EnemyHealthInput.Text,      gs.EnemyHealthFactor,          0.25, 4);
+            gs.EnemyStaminaFactor       = ParseDouble(EnemyStaminaInput.Text,     gs.EnemyStaminaFactor,         0.5,  2);
+            gs.EnemyPerceptionRangeFactor = ParseDouble(EnemyPerceptionInput.Text, gs.EnemyPerceptionRangeFactor, 0.5,  2);
+            gs.ThreatBonus              = ParseDouble(ThreatBonusInput.Text,      gs.ThreatBonus,                0.25, 4);
             gs.PacifyAllEnemies         = PacifyEnemiesCheck.IsChecked == true;
             gs.TamingStartleRepercussion = ComboValue(TamingRepercussionCombo,  gs.TamingStartleRepercussion);
 
-            gs.BossDamageFactor = ParseDouble(BossDamageInput.Text, gs.BossDamageFactor);
-            gs.BossHealthFactor = ParseDouble(BossHealthInput.Text, gs.BossHealthFactor);
+            gs.BossDamageFactor = ParseDouble(BossDamageInput.Text, gs.BossDamageFactor, 0.2, 5);
+            gs.BossHealthFactor = ParseDouble(BossHealthInput.Text, gs.BossHealthFactor, 0.2, 5);
 
             gs.CurseModifier = ComboValue(CurseModifierCombo, gs.CurseModifier);
 
@@ -602,8 +621,8 @@ public partial class MainWindow : Window
 
             // ── Backup tab ──
             c.AutoBackup.Enabled          = AutoBackupCheck.IsChecked == true;
-            c.AutoBackup.IntervalMinutes  = ParseInt(BackupIntervalInput.Text, c.AutoBackup.IntervalMinutes);
-            c.AutoBackup.KeepDays         = ParseInt(RetentionDaysInput.Text,  c.AutoBackup.KeepDays);
+            c.AutoBackup.IntervalMinutes  = ParseInt(BackupIntervalInput.Text, c.AutoBackup.IntervalMinutes, 5, 10080);
+            c.AutoBackup.KeepDays         = ParseInt(RetentionDaysInput.Text,  c.AutoBackup.KeepDays,        1, 365);
             c.AutoBackup.BackupOnShutdown = BackupOnShutdownCheck.IsChecked == true;
 
             if (_server.SaveConfig())
@@ -638,7 +657,7 @@ public partial class MainWindow : Window
             c.UserGroups.Add(g);
         }
         g.Password             = passBox.Text;
-        g.ReservedSlots        = ParseInt(reservedBox.Text, g.ReservedSlots);
+        g.ReservedSlots        = ParseInt(reservedBox.Text, g.ReservedSlots, 0, 16);
         g.CanKickBan           = kickBan.IsChecked    == true;
         g.CanAccessInventories = inventory.IsChecked  == true;
         g.CanEditWorld         = editWorld.IsChecked  == true;
@@ -724,11 +743,17 @@ public partial class MainWindow : Window
     private static int ParseInt(string text, int fallback)
         => int.TryParse(text, out int v) ? v : fallback;
 
+    private static int ParseInt(string text, int fallback, int min, int max)
+        => Math.Clamp(ParseInt(text, fallback), min, max);
+
     private static double ParseDouble(string text, double fallback)
         => double.TryParse(text,
             System.Globalization.NumberStyles.Any,
             System.Globalization.CultureInfo.InvariantCulture,
             out double v) ? v : fallback;
+
+    private static double ParseDouble(string text, double fallback, double min, double max)
+        => Math.Clamp(ParseDouble(text, fallback), min, max);
 
     // ── Tooltips ──────────────────────────────────────────────────────────────
     private void SetupTooltips()
@@ -742,15 +767,12 @@ public partial class MainWindow : Window
         // ── Server Settings — Identity ──
         ServerNameInput.ToolTip    = "Display name shown in the server browser. This also writes the \"name\" field in enshrouded_server.json.";
         ServerIpInput.ToolTip      = "IP address the server binds to. Leave blank or use 0.0.0.0 to bind all interfaces.";
-        GamePortInput.ToolTip      = "UDP port for game traffic (default: 15636). Must be open in your firewall/router.";
+        GamePortInput.ToolTip      = "UDP port for game traffic (default: 15636). Used for the firewall rule — " +
+                                     "current server versions no longer read a game port from enshrouded_server.json.";
         QueryPortInput.ToolTip     = "UDP port for Steam server queries (default: 15637). Required for server-browser discovery.";
         MaxPlayersInput.ToolTip    = "Maximum simultaneous players allowed (1–16).";
-        StartupParamsInput.ToolTip = "Extra command-line arguments appended when launching enshrouded_server.exe.";
-
-        // ── Server Settings — Launch Options ──
-        PvpEnabledCheck.ToolTip    = "Enable PvP mode. Adds the -pvp flag to the server launch command.";
-        MaxFpsInput.ToolTip        = "Server-side frame-rate cap. Lower values reduce CPU usage (e.g. 30). Affects physics tick smoothness.";
-        TickRateInput.ToolTip      = "Network update rate in Hz. Higher = more responsive but more bandwidth (default: 60).";
+        StartupParamsInput.ToolTip = "Extra command-line arguments appended when launching enshrouded_server.exe. " +
+                                     "The dedicated server currently documents no command-line options — leave blank unless you know you need this.";
 
         // ── Server Settings — Voice/Chat ──
         VoiceChatModeCombo.ToolTip     = "Voice chat scope: Proximity (nearby players only) or Global (everyone on the server).";
@@ -780,7 +802,7 @@ public partial class MainWindow : Window
 
         // ── Server Settings — Auto Restart ──
         AutoRestartCheck.ToolTip    = "Automatically restart the server on a recurring schedule.";
-        RestartIntervalInput.ToolTip = "How often (in minutes) to restart the server when auto-restart is enabled.";
+        RestartIntervalInput.ToolTip = "How often (in hours) to restart the server when auto-restart is enabled.";
         RestartWarningInput.ToolTip  = "Minutes before restart at which a warning is broadcast/logged.";
 
         // ── Gameplay Settings — Preset ──
@@ -799,26 +821,25 @@ public partial class MainWindow : Window
         EnableDurabilityCheck.ToolTip  = "When enabled, gear loses durability with use and can break.";
         EnableStarvingCheck.ToolTip    = "When enabled, going without food applies a starvation debuff.";
         FoodBuffDurationInput.ToolTip  = "Multiplier for how long food buffs last. 1.0 = normal. 2.0 = double duration.";
-        HungerToStarvingInput.ToolTip  = "Time in minutes from fully fed to starving. Default ≈ 16 min (960 s). " +
+        HungerToStarvingInput.ToolTip  = "Time in minutes from fully fed to starving. Default = 10 min, valid range 5–20. " +
                                          "Stored as nanoseconds in enshrouded_server.json.";
         ShroudTimeInput.ToolTip        = "Multiplier for how long the player can spend inside the Shroud. " +
                                          "1.0 = normal. Higher = more time allowed.";
         TombstoneModeCombo.ToolTip     = "What happens to your items on death:\n" +
-                                         "  NoTombstone – items drop where you die\n" +
-                                         "  AddBackpackMaterials – materials return to backpack\n" +
-                                         "  Tombstone – items stay in a grave to reclaim\n" +
-                                         "  Everything – all items kept on respawn";
+                                         "  AddBackpackMaterials – only materials go to the tombstone (default)\n" +
+                                         "  Everything – all backpack items go to the tombstone\n" +
+                                         "  NoTombstone – nothing is lost on death";
 
         // ── Gameplay — World & Environment ──
         WeatherFreqCombo.ToolTip       = "How often weather events occur: Disabled, Rare, Normal, or Often.";
-        FishingDifficultyCombo.ToolTip = "Fishing mini-game difficulty: Easy, Normal, Hard.";
+        FishingDifficultyCombo.ToolTip = "Fishing mini-game difficulty (fish strength): VeryEasy, Easy, Normal, Hard, VeryHard.";
         EnableGliderCheck.ToolTip      = "When enabled, gliding is affected by wind turbulences. Disable for smoother flight.";
         MiningDamageInput.ToolTip      = "Multiplier for damage dealt when mining ore/stone. 1.0 = normal. " +
                                          "Higher = mine faster.";
         PlantGrowthInput.ToolTip       = "Multiplier for crop/plant growth speed. 1.0 = normal. 2.0 = twice as fast.";
-        DayLengthInput.ToolTip         = "Length of daytime in minutes. Default = 30 min. " +
+        DayLengthInput.ToolTip         = "Length of daytime in minutes. Default = 30 min, valid range 2–60. " +
                                          "Stored as nanoseconds in enshrouded_server.json.";
-        NightLengthInput.ToolTip       = "Length of nighttime in minutes. Default = 10 min. " +
+        NightLengthInput.ToolTip       = "Length of nighttime in minutes. Default = 12 min, valid range 2–60. " +
                                          "Stored as nanoseconds in enshrouded_server.json.";
 
         // ── Gameplay — Resources & Economy ──
@@ -836,8 +857,8 @@ public partial class MainWindow : Window
 
         // ── Gameplay — Enemies ──
         EnemyAmountCombo.ToolTip      = "Overall enemy spawn density: Few, Normal, Many, or Extreme.";
-        AggroPoolCombo.ToolTip        = "Size of the aggro pool (how many enemies can be simultaneously hostile): " +
-                                        "Low, Normal, High, or Extreme.";
+        AggroPoolCombo.ToolTip        = "How many enemies are allowed to attack at the same time: " +
+                                        "Few, Normal, Many, or Extreme.";
         EnemyDamageInput.ToolTip      = "Multiplier for damage enemies deal to players. 1.0 = normal. " +
                                         "0.5 = half damage.";
         EnemyHealthInput.ToolTip      = "Multiplier for enemy max health. 1.0 = normal. 2.0 = double HP.";
@@ -846,20 +867,24 @@ public partial class MainWindow : Window
                                         "Lower = shorter sight radius.";
         ThreatBonusInput.ToolTip      = "Bonus multiplier added to the overall threat level, increasing enemy aggression.";
         PacifyEnemiesCheck.ToolTip    = "When enabled, all enemies are pacified and will not attack players.";
-        TamingRepercussionCombo.ToolTip = "What happens when a taming attempt startles an animal:\n" +
-                                          "  None – no penalty\n" +
-                                          "  Hurt – animal takes damage\n" +
-                                          "  Kill – animal dies";
+        TamingRepercussionCombo.ToolTip = "What happens to taming progress when the animal is startled:\n" +
+                                          "  KeepProgress – no penalty\n" +
+                                          "  LoseSomeProgress – part of the progress is lost (default)\n" +
+                                          "  LoseAllProgress – taming starts over";
 
         // ── Gameplay — Bosses ──
         BossDamageInput.ToolTip = "Multiplier for damage bosses deal to players. 1.0 = normal.";
         BossHealthInput.ToolTip = "Multiplier for boss max health. 1.0 = normal. 2.0 = double HP.";
 
         // ── Gameplay — Miscellaneous ──
-        CurseModifierCombo.ToolTip = "Adjusts the potency/frequency of curses: None, Low, Normal, or High.";
+        CurseModifierCombo.ToolTip = "Chance of receiving the Shroud curse when attacked:\n" +
+                                     "  Easy – curse disabled\n" +
+                                     "  Normal – default chance\n" +
+                                     "  Hard – double chance";
 
         // ── User Groups ──
-        const string passHint     = "Password required to join this group. Leave blank for no password.";
+        const string passHint     = "Password required to join this group. The server refuses to start when a group " +
+                                    "password is empty — if left blank, a random password is generated on server start.";
         const string reservedHint = "Number of player slots reserved exclusively for this group.";
         const string kickBanHint  = "Allow members of this group to kick and ban other players.";
         const string inventoryHint = "Allow members of this group to access other players' inventories.";

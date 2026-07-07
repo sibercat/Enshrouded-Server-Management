@@ -18,9 +18,13 @@ public class BackupManager
         _server = server;
     }
 
+    private int _scheduledIntervalMinutes;
+
     public void Start()
     {
-        if (_loopTask is { IsCompleted: false })
+        // Same rule as RestartManager: a loop with a cancelled token is as good
+        // as stopped — replace it (happens when a restart cycles this manager).
+        if (_loopTask is { IsCompleted: false } && _cts is { IsCancellationRequested: false })
         {
             AppLogger.Info("Backup manager already running.");
             return;
@@ -28,13 +32,15 @@ public class BackupManager
 
         ScheduleNext();
         _cts = new CancellationTokenSource();
-        _loopTask = Task.Run(() => RunLoopAsync(_cts.Token));
+        var token = _cts.Token;
+        _loopTask = Task.Run(() => RunLoopAsync(token));
         AppLogger.Info("Backup manager started.");
     }
 
     public void Stop()
     {
         _cts?.Cancel();
+        NextBackup = null;
         AppLogger.Info("Backup manager stop requested.");
     }
 
@@ -42,21 +48,30 @@ public class BackupManager
     {
         if (Config.AutoBackup.Enabled)
         {
-            if (_loopTask is null or { IsCompleted: true })
-                Start();
-            else
-                ScheduleNext(); // Recalculate interval if already running
+            if (_loopTask is null or { IsCompleted: true } || _cts is null or { IsCancellationRequested: true })
+            {
+                if (_server.IsRunning())
+                    Start();
+            }
+            else if (Config.AutoBackup.IntervalMinutes != _scheduledIntervalMinutes)
+            {
+                ScheduleNext(); // interval changed — recompute; otherwise keep the current schedule
+            }
         }
         else
         {
             Stop();
-            NextBackup = null;
         }
     }
 
-    public async Task ShutdownAsync()
+    /// <param name="performBackup">
+    /// False when the caller already ran the shutdown backup (StopAsync does it
+    /// after stopping the server) or the server is still running — zipping a
+    /// live savegame risks a corrupt archive.
+    /// </param>
+    public async Task ShutdownAsync(bool performBackup = true)
     {
-        if (Config.AutoBackup.BackupOnShutdown)
+        if (performBackup && Config.AutoBackup.BackupOnShutdown)
         {
             AppLogger.Info("Performing shutdown backup...");
             await PerformBackupAsync();
@@ -70,7 +85,8 @@ public class BackupManager
     {
         if (Config.AutoBackup.Enabled)
         {
-            NextBackup = DateTime.Now.AddMinutes(Config.AutoBackup.IntervalMinutes);
+            _scheduledIntervalMinutes = Config.AutoBackup.IntervalMinutes;
+            NextBackup = DateTime.Now.AddMinutes(_scheduledIntervalMinutes);
             AppLogger.Info($"Next backup scheduled: {NextBackup:yyyy-MM-dd HH:mm:ss}");
         }
         else
@@ -81,8 +97,6 @@ public class BackupManager
 
     private async Task RunLoopAsync(CancellationToken ct)
     {
-        var lastCleanupCheck = DateTime.Now;
-
         while (!ct.IsCancellationRequested)
         {
             try
@@ -90,6 +104,7 @@ public class BackupManager
                 if (!_server.IsRunning())
                 {
                     AppLogger.Info("Server stopped — backup manager exiting.");
+                    NextBackup = null;
                     break;
                 }
 
@@ -97,13 +112,6 @@ public class BackupManager
 
                 if (NextBackup.HasValue && now >= NextBackup.Value)
                 {
-                    // Daily cleanup check
-                    if (now - lastCleanupCheck > TimeSpan.FromDays(1))
-                    {
-                        CleanupOldBackups();
-                        lastCleanupCheck = now;
-                    }
-
                     bool ok = await PerformBackupAsync();
                     NextBackup = ok
                         ? DateTime.Now.AddMinutes(Config.AutoBackup.IntervalMinutes)
@@ -156,6 +164,7 @@ public class BackupManager
             });
 
             AppLogger.Info($"Backup created successfully: {backupPath}");
+            CleanupOldBackups();
             return true;
         }
         catch (Exception ex)

@@ -64,6 +64,11 @@ EnshroudedServer\
 - SteamCMD is downloaded automatically on first Update.
 - On **Windows Server**, install the Visual C++ Redistributable before clicking Update.
   SteamCMD exits with code 8 if it is missing.
+- **User group passwords cannot be empty** — the Enshrouded server exits immediately on
+  startup if any group has a blank password. If you leave a password blank, the manager
+  generates a random one when the server starts (visible in Settings → User Groups).
+- The dedicated server takes no command-line arguments; all configuration is written to
+  `enshrouded_server.json` before each start.
 
 ## GitHub
 

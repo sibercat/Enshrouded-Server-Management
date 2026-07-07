@@ -34,8 +34,10 @@ public class ServerLauncher
                 return null;
             }
 
-            var args = BuildStartupArgs();
-            AppLogger.Info($"Launching: {serverExe} {args}");
+            // The dedicated server takes no documented command-line arguments —
+            // all configuration lives in enshrouded_server.json.
+            var args = Config.StartupParams.Trim();
+            AppLogger.Info($"Launching: {serverExe}{(args.Length > 0 ? " " + args : "")}");
 
             var process = Process.Start(new ProcessStartInfo
             {
@@ -53,10 +55,16 @@ public class ServerLauncher
 
             await Task.Delay(5000);
 
+            if (process.HasExited)
+            {
+                AppLogger.Error($"Server process exited immediately (exit code {SafeExitCode(process)}).");
+                AppLogger.Error("Check enshrouded_server.json — for example, every user group must have a non-empty password.");
+                return null;
+            }
+
             AppLogger.Info("Server launched successfully.");
             AppLogger.Info($"  Name      : {Config.ServerName}");
             AppLogger.Info($"  Players   : {Config.MaxPlayers}");
-            AppLogger.Info($"  Game Port : {Config.GamePort}");
             AppLogger.Info($"  Preset    : {Config.GameSettingsPreset}");
             return process;
         }
@@ -67,24 +75,9 @@ public class ServerLauncher
         }
     }
 
-    private string BuildStartupArgs()
+    private static string SafeExitCode(Process process)
     {
-        var parts = new List<string>
-        {
-            $"-servername \"{Config.ServerName}\"",
-            $"-gameport {Config.GamePort}",
-            $"-queryport {Config.QueryPort}",
-            $"-maxplayers {Config.MaxPlayers}",
-            $"-maxfps {Config.MaxFps}",
-            $"-tickrate {Config.TickRate}"
-        };
-
-        if (Config.PvpEnabled)
-            parts.Add("-pvp");
-
-        if (!string.IsNullOrWhiteSpace(Config.StartupParams))
-            parts.Add(Config.StartupParams);
-
-        return string.Join(" ", parts);
+        try { return process.ExitCode.ToString(); }
+        catch { return "unknown"; }
     }
 }
