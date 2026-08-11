@@ -8,8 +8,8 @@ namespace EnshroudedServerManager.Core;
 public class ServerManager
 {
     // ── Constants ─────────────────────────────────────────────────────────────
-    public const string Version   = "1.0.1";
-    public const string BuildDate = "2026-07-06";
+    public const string Version   = "1.0.2";
+    public const string BuildDate = "2026-08-11";
     private const string ProcessName = "enshrouded_server";
 
     // ── State ─────────────────────────────────────────────────────────────────
@@ -28,11 +28,20 @@ public class ServerManager
     private bool _intentionalStop = false;
     public bool WasCrash { get; private set; } = false;
 
-    // Crash auto-restart limiter — give up after repeated rapid crashes
+    /// <summary>
+    /// True once a stop has run the BackupOnShutdown backup, so closing the app
+    /// afterwards doesn't zip the same untouched savegame a second time.
+    /// Cleared on the next start.
+    /// </summary>
+    public bool ShutdownBackupCompleted { get; private set; }
+
+    // Crash auto-restart limiter — give up after repeated rapid crashes.
+    // "Rapid" is measured as the uptime that just ended, not the gap between
+    // crashes, so a server that recovered doesn't stay permanently limited.
     private const int MaxConsecutiveCrashRestarts = 3;
-    private static readonly TimeSpan CrashCounterResetWindow = TimeSpan.FromMinutes(15);
+    private static readonly TimeSpan MinHealthyUptime = TimeSpan.FromMinutes(15);
     private int _crashRestartAttempts;
-    private DateTime _lastCrashAt = DateTime.MinValue;
+    private DateTime _lastStartAt = DateTime.MinValue;
 
     // CPU tracking
     private DateTime  _lastCpuSample   = DateTime.MinValue;
@@ -41,6 +50,21 @@ public class ServerManager
     // ── Public surface ────────────────────────────────────────────────────────
     public ServerConfig Config => _configManager.Config;
     public string ServerVersion => _serverVersion;
+
+    // The server logs this line once the world has finished loading and players can
+    // actually join. Verified against server build 1024233.
+    private const string ReadyMarker = "[Session] 'HostOnline' (up)!";
+    private static readonly TimeSpan ReadyTimeout = TimeSpan.FromMinutes(3);
+
+    /// <summary>
+    /// True once the running server has reported its session is up. A live process
+    /// is not the same thing — the world still has to deserialize first.
+    /// </summary>
+    public bool IsReady { get; private set; }
+
+    /// <summary>True when the dedicated server binary is present in ServerDir.</summary>
+    public bool IsServerInstalled =>
+        File.Exists(Path.Combine(Config.ServerDir, "enshrouded_server.exe"));
 
     public BackupManager  BackupManager  => _backupManager  ??= new BackupManager(this);
     public RestartManager RestartManager => _restartManager ??= new RestartManager(this);
@@ -57,7 +81,10 @@ public class ServerManager
     {
         try
         {
+            // Each returned Process holds a native handle until disposed, and the
+            // status timer calls this every few seconds for the app's whole life.
             var procs = Process.GetProcessesByName(ProcessName);
+            foreach (var p in procs) p.Dispose();
             return procs.Length > 0;
         }
         catch (Exception ex)
@@ -78,6 +105,12 @@ public class ServerManager
 
         AppLogger.Info("Starting Enshrouded server...");
         _intentionalStop = false;   // clear flag so crash detection is active again
+        ShutdownBackupCompleted = false;
+        IsReady = false;
+
+        // Taken before launch so we can tell the new run's log from the previous
+        // one, which the server archives into logs/backup on startup.
+        var launchedAt = DateTime.Now;
         var process = await _launcher.LaunchAsync();
         if (process == null || !IsRunning())
         {
@@ -86,6 +119,7 @@ public class ServerManager
         }
 
         _serverProcess = process;
+        _lastStartAt   = DateTime.Now;
 
         // Start managers if configured
         if (Config.AutoBackup.Enabled)
@@ -95,9 +129,30 @@ public class ServerManager
 
         _lastVersionCheck = DateTime.MinValue;
         TryUpdateServerVersion();
-        AppLogger.Info("Server started successfully.");
-        _ = DiscordService.SendAsync(Config.DiscordStatusWebhookUrl,
-            $"✅ **{Config.ServerName}** — Server started.");
+
+        // Don't announce a server nobody can join yet — wait for it to report in.
+        AppLogger.Info("Server process started — waiting for the world to load...");
+        IsReady = await WaitForReadyAsync(launchedAt);
+
+        if (IsReady)
+        {
+            AppLogger.Info("Server is up and accepting players.");
+            _ = DiscordService.SendAsync(Config.DiscordStatusWebhookUrl,
+                $"✅ **{Config.ServerName}** — Server started and is now joinable.");
+        }
+        else if (!IsRunning())
+        {
+            AppLogger.Error("Server process exited while loading the world.");
+            return false;
+        }
+        else
+        {
+            AppLogger.Warning($"Server has not reported ready within {ReadyTimeout.TotalMinutes:F0} minutes — " +
+                              "it may still be loading a large world. Check the server log.");
+            _ = DiscordService.SendAsync(Config.DiscordStatusWebhookUrl,
+                $"✅ **{Config.ServerName}** — Server started (still loading).");
+        }
+
         return true;
     }
 
@@ -113,6 +168,7 @@ public class ServerManager
         AppLogger.Info("Stopping Enshrouded server...");
         _intentionalStop = true;
         WasCrash = false;
+        IsReady  = false;
 
         _backupManager?.Stop();
         _restartManager?.Stop();
@@ -120,9 +176,14 @@ public class ServerManager
         // Graceful terminate first. If we don't hold a handle (server was started
         // before this app, or the app was relaunched), attach to the running
         // process by name so Stop is still graceful rather than an instant kill.
-        var target = _serverProcess is { HasExited: false }
-            ? _serverProcess
-            : Process.GetProcessesByName(ProcessName).FirstOrDefault();
+        Process? attached = null;
+        if (_serverProcess is not { HasExited: false })
+        {
+            var procs = Process.GetProcessesByName(ProcessName);
+            attached = procs.FirstOrDefault();
+            for (int i = 1; i < procs.Length; i++) procs[i].Dispose();
+        }
+        var target = attached ?? (_serverProcess is { HasExited: false } ? _serverProcess : null);
 
         bool stopped = false;
         if (target is { HasExited: false })
@@ -134,6 +195,7 @@ public class ServerManager
             }
             catch { }
         }
+        attached?.Dispose();
 
         // Force kill if still running
         if (!stopped || IsRunning())
@@ -174,6 +236,7 @@ public class ServerManager
         {
             AppLogger.Info("BackupOnShutdown enabled — creating backup...");
             await BackupManager.PerformBackupAsync();
+            ShutdownBackupCompleted = true;
         }
 
         return true;
@@ -284,11 +347,11 @@ public class ServerManager
         // A successful StopAsync already runs the BackupOnShutdown backup, so
         // only ask ShutdownAsync to back up when that didn't happen — and never
         // while the server is still running (live savegame files).
-        bool stoppedAndBackedUp = false;
         if (IsRunning())
-            stoppedAndBackedUp = await StopAsync();
+            await StopAsync();
 
-        await BackupManager.ShutdownAsync(performBackup: !stoppedAndBackedUp && !IsRunning());
+        await BackupManager.ShutdownAsync(
+            performBackup: !ShutdownBackupCompleted && !IsRunning());
 
         AppLogger.Info("Shutdown complete.");
     }
@@ -301,7 +364,9 @@ public class ServerManager
             var procs = Process.GetProcessesByName(ProcessName);
             if (procs.Length == 0) return (0, 0);
 
-            var proc = procs[0];
+            using var proc = procs[0];
+            for (int i = 1; i < procs.Length; i++) procs[i].Dispose();
+
             double memMb = proc.WorkingSet64 / 1024.0 / 1024.0;
 
             var now       = DateTime.UtcNow;
@@ -338,23 +403,27 @@ public class ServerManager
 
         if (Config.AutoRestartOnCrash)
         {
-            // Rapid crash loop protection: after 3 crashes in quick succession,
-            // stop restarting — something is wrong that a restart won't fix.
-            var now = DateTime.Now;
-            if (now - _lastCrashAt > CrashCounterResetWindow)
+            // Rapid crash-loop protection: only consecutive short-lived runs count.
+            // If the run that just ended lasted longer than MinHealthyUptime the
+            // server had recovered, so the counter starts over — otherwise a fixed
+            // and manually restarted server would give up on its very first crash.
+            var uptime = _lastStartAt == DateTime.MinValue
+                ? TimeSpan.MaxValue          // started outside this app — uptime unknown
+                : DateTime.Now - _lastStartAt;
+            if (uptime > MinHealthyUptime)
                 _crashRestartAttempts = 0;
-            _lastCrashAt = now;
 
-            if (++_crashRestartAttempts > MaxConsecutiveCrashRestarts)
+            if (_crashRestartAttempts >= MaxConsecutiveCrashRestarts)
             {
-                AppLogger.Error($"Server crashed {MaxConsecutiveCrashRestarts} times within " +
-                                $"{CrashCounterResetWindow.TotalMinutes:F0} minutes — giving up on automatic restarts. " +
-                                "Check the server logs, then start it manually.");
+                AppLogger.Error($"Server crashed again after {MaxConsecutiveCrashRestarts} automatic restart(s) " +
+                                $"without staying up for {MinHealthyUptime.TotalMinutes:F0} minutes — giving up on " +
+                                "automatic restarts. Check the server logs, then start it manually.");
                 await DiscordService.SendAsync(Config.DiscordStatusWebhookUrl,
                     $"🛑 **{Config.ServerName}** — Crashed repeatedly; automatic restarts suspended.");
                 return;
             }
 
+            _crashRestartAttempts++;
             var delay = Math.Max(1, Config.CrashRestartDelaySeconds);
             AppLogger.Info($"Auto Restart on Crash enabled — restarting in {delay} second(s)... " +
                            $"(attempt {_crashRestartAttempts}/{MaxConsecutiveCrashRestarts})");
@@ -377,6 +446,49 @@ public class ServerManager
             _restartManager?.UpdateFromConfig();
         }
         return ok;
+    }
+
+    // ── Readiness ─────────────────────────────────────────────────────────────
+    /// <summary>
+    /// Polls the current run's log until the server reports its session is up.
+    /// Returns false if it times out or the process dies while loading.
+    /// </summary>
+    private async Task<bool> WaitForReadyAsync(DateTime launchedAt)
+    {
+        var logPath  = Path.Combine(Config.ServerDir, "logs", "enshrouded_server.log");
+        var deadline = DateTime.Now + ReadyTimeout;
+
+        // Filesystem timestamp granularity can put the new log a hair before our
+        // launch instant, so allow a little slack when deciding it's the new one.
+        var freshAfter = launchedAt.AddSeconds(-5);
+
+        while (DateTime.Now < deadline)
+        {
+            if (!IsRunning()) return false;
+
+            try
+            {
+                if (File.Exists(logPath) && File.GetLastWriteTime(logPath) >= freshAfter)
+                {
+                    using var fs     = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                    using var reader = new StreamReader(fs);
+                    string? line;
+                    while ((line = reader.ReadLine()) != null)
+                    {
+                        if (line.Contains(ReadyMarker, StringComparison.Ordinal))
+                            return true;
+                    }
+                }
+            }
+            catch
+            {
+                // Log locked or being rotated — just try again next tick.
+            }
+
+            await Task.Delay(1000);
+        }
+
+        return false;
     }
 
     // ── Server version ────────────────────────────────────────────────────────

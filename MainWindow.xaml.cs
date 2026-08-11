@@ -16,6 +16,7 @@ public partial class MainWindow : Window
     private bool _isOperationRunning;
     private bool _shutdownInProgress;
     private bool _lastRunningState;
+    private string _lastStatusText = "";
 
     // Tag name → CheckBox mapping (populated in ctor)
     private readonly Dictionary<string, CheckBox> _tagCheckBoxes = new();
@@ -120,13 +121,22 @@ public partial class MainWindow : Window
                 AppendConsole("Shutting down...");
                 await _server.ShutdownAsync();
             }
-            else if (!running)
+            else if (running)
             {
-                // Server already stopped — run the shutdown backup if enabled
-                await _server.BackupManager.ShutdownAsync();
+                // Leaving the server up: still stop our own loops, or an in-flight
+                // scheduled restart can take down the server the user just asked to
+                // keep alive. No backup either — the savegame files are in use and
+                // the archive could come out corrupt.
+                _server.RestartManager.Stop();
+                await _server.BackupManager.ShutdownAsync(performBackup: false);
             }
-            // else: leaving the server running — skip the backup, its savegame
-            // files are in use and the archive could come out corrupt
+            else
+            {
+                // Server already stopped — run the shutdown backup unless Stop
+                // already made one, which would just duplicate it.
+                await _server.BackupManager.ShutdownAsync(
+                    performBackup: !_server.ShutdownBackupCompleted);
+            }
         }
         catch (Exception ex)
         {
@@ -138,7 +148,33 @@ public partial class MainWindow : Window
     }
 
     // ── Buttons ───────────────────────────────────────────────────────────────
-    private async void StartBtn_Click(object sender, RoutedEventArgs e)   => await RunOperationAsync("start",   () => _server.StartAsync());
+    private async void StartBtn_Click(object sender, RoutedEventArgs e)
+    {
+        // Starting a server that was never installed used to fail with nothing but
+        // "executable not found". Offer the install instead — but ask first, because
+        // it's a multi-gigabyte SteamCMD download.
+        if (!_server.IsServerInstalled)
+        {
+            var answer = MessageBox.Show(
+                "The Enshrouded server files aren't installed yet.\n\n" +
+                $"Install them now into:\n{_server.Config.ServerDir}\n\n" +
+                "The server files are around 13 GB; 30 GB of free space is recommended. " +
+                "This downloads via SteamCMD and can take a while.",
+                "Server Not Installed", MessageBoxButton.YesNo, MessageBoxImage.Question);
+
+            if (answer != MessageBoxResult.Yes)
+            {
+                AppendConsole("Server is not installed — use 'Update Server' to install it.");
+                return;
+            }
+
+            if (!await RunOperationAsync("update", () => _server.UpdateAsync()))
+                return;
+        }
+
+        await RunOperationAsync("start", () => _server.StartAsync());
+    }
+
     private async void StopBtn_Click(object sender, RoutedEventArgs e)    => await RunOperationAsync("stop",    () => _server.StopAsync());
     private async void RestartBtn_Click(object sender, RoutedEventArgs e) => await RunOperationAsync("restart", () => _server.RestartAsync());
     private async void UpdateBtn_Click(object sender, RoutedEventArgs e)  => await RunOperationAsync("update",  () => _server.UpdateAsync());
@@ -329,9 +365,9 @@ public partial class MainWindow : Window
     }
 
     // ── Operation runner ──────────────────────────────────────────────────────
-    private async Task RunOperationAsync(string name, Func<Task<bool>> op)
+    private async Task<bool> RunOperationAsync(string name, Func<Task<bool>> op)
     {
-        if (_isOperationRunning) return;
+        if (_isOperationRunning) return false;
         _isOperationRunning = true;
         SetButtons(false);
         AppendConsole($"Executing: {name}...");
@@ -340,17 +376,24 @@ public partial class MainWindow : Window
         {
             bool ok = await op();
             AppendConsole(ok ? $"'{name}' completed." : $"'{name}' failed — check logs.");
-            if (ok && name is "start" or "restart")
-                RefreshUserGroupFields(); // starting may auto-generate blank group passwords
+
+            // Blank group passwords are generated and persisted before the launch is
+            // even attempted, so refresh whether or not it succeeded — otherwise the
+            // boxes stay blank and the next Save Settings writes over what was stored.
+            if (name is "start" or "restart")
+                RefreshUserGroupFields();
             if (!ok)
                 MessageBox.Show($"Failed to {name} server.", "Operation Failed",
                     MessageBoxButton.OK, MessageBoxImage.Warning);
+
+            return ok;
         }
         catch (Exception ex)
         {
             AppLogger.Error($"Error in '{name}': {ex.Message}");
             MessageBox.Show($"Error during {name}:\n{ex.Message}", "Error",
                 MessageBoxButton.OK, MessageBoxImage.Error);
+            return false;
         }
         finally
         {
@@ -365,17 +408,24 @@ public partial class MainWindow : Window
     {
         bool running = _server.IsRunning();
 
-        if (running != _lastRunningState)
+        // A live process isn't necessarily a joinable server — the world has to load
+        // first, which is seconds on a new world and much longer on a large one.
+        string state = !running ? "Stopped" : _server.IsReady ? "Running" : "Loading...";
+
+        if (running != _lastRunningState || state != _lastStatusText)
         {
-            StatusIndicator.Text       = running ? "Running" : "Stopped";
-            StatusIndicator.Foreground = running ? Brushes.Green : Brushes.Red;
-            AppendConsole($"Server status: {(running ? "Running" : "Stopped")}");
+            StatusIndicator.Text = state;
+            StatusIndicator.Foreground = !running        ? Brushes.Red
+                                       : _server.IsReady ? Brushes.Green
+                                                         : Brushes.DarkOrange;
+            AppendConsole($"Server status: {state}");
 
             // If server went from running to stopped without us stopping it — crash
             if (!running && _lastRunningState)
                 _ = _server.NotifyCrashIfUnexpectedAsync();
 
             _lastRunningState = running;
+            _lastStatusText   = state;
         }
 
         VersionLabel.Text    = $"  |  Server Version: {_server.ServerVersion}";
@@ -538,6 +588,7 @@ public partial class MainWindow : Window
         {
             var c  = _server.Config;
             var gs = c.GameSettings;
+            _valueWasClamped = false;
 
             // ── Server tab ──
             c.ServerName   = ServerNameInput.Text.Trim();
@@ -558,7 +609,10 @@ public partial class MainWindow : Window
 
             c.AutoRestart              = AutoRestartCheck.IsChecked == true;
             c.RestartInterval          = ParseInt(RestartIntervalInput.Text,    c.RestartInterval,       1, 720);
-            c.RestartWarningMinutes    = ParseInt(RestartWarningInput.Text,     c.RestartWarningMinutes, 0, 120);
+            // The warning has to fit inside the interval — a longer one would trip on
+            // the first scheduler pass and push every restart out by the warning window.
+            c.RestartWarningMinutes    = ParseInt(RestartWarningInput.Text,     c.RestartWarningMinutes,
+                                                  0, Math.Min(120, c.RestartInterval * 60 - 1));
             c.AutoRestartOnCrash       = AutoRestartOnCrashCheck.IsChecked == true;
             c.CrashRestartDelaySeconds = ParseInt(CrashRestartDelayInput.Text,  c.CrashRestartDelaySeconds, 1, 3600);
             c.DiscordStatusWebhookUrl = DiscordStatusWebhookInput.Text.Trim();
@@ -627,10 +681,20 @@ public partial class MainWindow : Window
 
             if (_server.SaveConfig())
             {
+                // Out-of-range entries were clamped to what the server accepts.
+                // Repopulate so the boxes show what was actually stored.
+                PopulateSettings();
+                PopulateGameplayTab();
+                RefreshUserGroupFields();
+
                 AppendConsole("Settings saved.");
                 ServerNameLabel.Text = $"Server: {c.ServerName}";
-                MessageBox.Show("Settings saved successfully.", "Saved",
-                    MessageBoxButton.OK, MessageBoxImage.Information);
+                MessageBox.Show(
+                    _valueWasClamped
+                        ? "Settings saved.\n\nSome values were outside the range the server accepts and " +
+                          "have been adjusted — the fields now show what was saved."
+                        : "Settings saved successfully.",
+                    "Saved", MessageBoxButton.OK, MessageBoxImage.Information);
             }
             else
             {
@@ -646,7 +710,7 @@ public partial class MainWindow : Window
         }
     }
 
-    private static void SaveUserGroup(ServerConfig c, string name,
+    private void SaveUserGroup(ServerConfig c, string name,
         TextBox passBox, TextBox reservedBox,
         CheckBox kickBan, CheckBox inventory, CheckBox editWorld, CheckBox editBase, CheckBox extendBase)
     {
@@ -656,7 +720,14 @@ public partial class MainWindow : Window
             g = new UserGroup { Name = name };
             c.UserGroups.Add(g);
         }
-        g.Password             = passBox.Text;
+
+        // A blank box must never wipe a stored password — the server refuses to start
+        // with an empty group password, so blank is never a valid saved value, and the
+        // stored one may already be in players' hands.
+        var typedPassword = passBox.Text.Trim();
+        if (typedPassword.Length > 0)
+            g.Password = typedPassword;
+
         g.ReservedSlots        = ParseInt(reservedBox.Text, g.ReservedSlots, 0, 16);
         g.CanKickBan           = kickBan.IsChecked    == true;
         g.CanAccessInventories = inventory.IsChecked  == true;
@@ -743,8 +814,17 @@ public partial class MainWindow : Window
     private static int ParseInt(string text, int fallback)
         => int.TryParse(text, out int v) ? v : fallback;
 
-    private static int ParseInt(string text, int fallback, int min, int max)
-        => Math.Clamp(ParseInt(text, fallback), min, max);
+    // Clamping overloads record when they had to correct a value so SaveSettings can
+    // tell the user instead of silently storing something other than what they typed.
+    private bool _valueWasClamped;
+
+    private int ParseInt(string text, int fallback, int min, int max)
+    {
+        int raw     = ParseInt(text, fallback);
+        int clamped = Math.Clamp(raw, min, max);
+        if (clamped != raw) _valueWasClamped = true;
+        return clamped;
+    }
 
     private static double ParseDouble(string text, double fallback)
         => double.TryParse(text,
@@ -752,8 +832,13 @@ public partial class MainWindow : Window
             System.Globalization.CultureInfo.InvariantCulture,
             out double v) ? v : fallback;
 
-    private static double ParseDouble(string text, double fallback, double min, double max)
-        => Math.Clamp(ParseDouble(text, fallback), min, max);
+    private double ParseDouble(string text, double fallback, double min, double max)
+    {
+        double raw     = ParseDouble(text, fallback);
+        double clamped = Math.Clamp(raw, min, max);
+        if (clamped != raw) _valueWasClamped = true;
+        return clamped;
+    }
 
     // ── Tooltips ──────────────────────────────────────────────────────────────
     private void SetupTooltips()

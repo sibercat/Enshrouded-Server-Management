@@ -71,7 +71,10 @@ public class BackupManager
     /// </param>
     public async Task ShutdownAsync(bool performBackup = true)
     {
-        if (performBackup && Config.AutoBackup.BackupOnShutdown)
+        // A fresh install that never ran the server has no savegame to archive.
+        // Skipping quietly beats PerformBackupAsync logging that as an error.
+        if (performBackup && Config.AutoBackup.BackupOnShutdown
+            && Directory.Exists(Path.Combine(Config.ServerDir, "savegame")))
         {
             AppLogger.Info("Performing shutdown backup...");
             await PerformBackupAsync();
@@ -113,6 +116,12 @@ public class BackupManager
                 if (NextBackup.HasValue && now >= NextBackup.Value)
                 {
                     bool ok = await PerformBackupAsync();
+
+                    // A backup can take long enough for Stop() to land while we were
+                    // zipping. Stop() cleared NextBackup; don't resurrect it, or the
+                    // UI shows a scheduled backup with no loop left to run it.
+                    if (ct.IsCancellationRequested) break;
+
                     NextBackup = ok
                         ? DateTime.Now.AddMinutes(Config.AutoBackup.IntervalMinutes)
                         : DateTime.Now.AddMinutes(5); // retry sooner on failure
@@ -164,7 +173,10 @@ public class BackupManager
             });
 
             AppLogger.Info($"Backup created successfully: {backupPath}");
-            CleanupOldBackups();
+
+            // Manual and shutdown backups are awaited from the UI thread, and
+            // cleanup enumerates and deletes across the whole backup folder.
+            await Task.Run(CleanupOldBackups);
             return true;
         }
         catch (Exception ex)

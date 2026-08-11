@@ -92,8 +92,12 @@ public class ConfigManager
                 {
                     group.Password = GeneratePassword(group.Name);
                     generated = true;
-                    AppLogger.Warning($"User group '{group.Name}' had an empty password — generated '{group.Password}'. " +
-                                      "(The server refuses to start when a group password is blank.)");
+                    // Never log the password itself — this line also goes to the
+                    // on-screen console and to server_manager.log, which users paste
+                    // into bug reports.
+                    AppLogger.Warning($"User group '{group.Name}' had an empty password — one was generated " +
+                                      "(the server refuses to start when a group password is blank). " +
+                                      "See Settings → User Groups.");
                 }
             }
             if (generated)
@@ -157,6 +161,21 @@ public class ConfigManager
                 catch { }
             }
 
+            // A non-empty top-level "password" is the pre-Update-2 format. The server
+            // turns it into a hidden "default" user group with Friend-level access
+            // that this app neither shows nor manages — and the merge above would
+            // otherwise preserve it forever. Drop it so Settings → User Groups stays
+            // the only thing deciding who can join.
+            if (serverObj["password"] is JsonValue legacy
+                && legacy.TryGetValue<string>(out var legacyPassword)
+                && !string.IsNullOrWhiteSpace(legacyPassword))
+            {
+                serverObj.Remove("password");
+                AppLogger.Warning("Removed a legacy top-level \"password\" from enshrouded_server.json — " +
+                                  "it granted Friend-level access through an unmanaged 'default' user " +
+                                  "group. Access is now controlled by Settings → User Groups only.");
+            }
+
             serverObj["name"]               = Config.ServerName;
             serverObj["saveDirectory"]      = "./savegame";
             serverObj["logDirectory"]       = "./logs";
@@ -168,7 +187,23 @@ public class ConfigManager
             serverObj["enableVoiceChat"]    = Config.EnableVoiceChat;
             serverObj["enableTextChat"]     = Config.EnableTextChat;
             serverObj["gameSettingsPreset"] = Config.GameSettingsPreset;
-            serverObj["gameSettings"]       = JsonSerializer.SerializeToNode(gameSettingsObj);
+
+            // gameSettings is merged key-by-key for the same reason as the top level:
+            // the server owns keys in here too, and a game update can add ones this
+            // app doesn't model. Replacing the whole object would silently revert them.
+            var managedGameSettings = JsonSerializer.SerializeToNode(gameSettingsObj)!.AsObject();
+            if (serverObj["gameSettings"] is JsonObject existingGameSettings)
+            {
+                foreach (var setting in managedGameSettings)
+                    existingGameSettings[setting.Key] = setting.Value?.DeepClone();
+            }
+            else
+            {
+                serverObj["gameSettings"] = managedGameSettings;
+            }
+
+            // userGroups is intentionally replaced wholesale — the manager owns the
+            // full group list and a stale group left behind would still grant access.
             serverObj["userGroups"]         = userGroupsNode;
 
             File.WriteAllText(serverJsonPath, serverObj.ToJsonString(GameJsonOptions));

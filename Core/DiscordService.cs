@@ -18,7 +18,7 @@ public static class DiscordService
         {
             var payload = JsonSerializer.Serialize(new { content = message });
             using var content = new StringContent(payload, Encoding.UTF8, "application/json");
-            var response = await Http.PostAsync(webhookUrl, content);
+            using var response = await Http.PostAsync(webhookUrl, content);
 
             if (!response.IsSuccessStatusCode)
                 AppLogger.Warning($"Discord webhook returned {(int)response.StatusCode}: {response.ReasonPhrase}");

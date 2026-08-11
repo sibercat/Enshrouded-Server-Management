@@ -24,19 +24,25 @@ public class ServerLauncher
                 return null;
             }
 
-            if (!_configManager.UpdateServerJson(Config.ServerDir))
-                AppLogger.Warning("Failed to update enshrouded_server.json — launching anyway.");
-
+            // Check for the binary before touching enshrouded_server.json — writing
+            // config (and generating group passwords) for a server that isn't
+            // installed just leaves confusing state behind.
             var serverExe = Path.Combine(Config.ServerDir, "enshrouded_server.exe");
             if (!File.Exists(serverExe))
             {
-                AppLogger.Error($"Server executable not found: {serverExe}");
+                AppLogger.Error($"Server executable not found: {serverExe} — " +
+                                "run 'Update Server' to install the server files.");
                 return null;
             }
 
+            if (!_configManager.UpdateServerJson(Config.ServerDir))
+                AppLogger.Warning("Failed to update enshrouded_server.json — launching anyway.");
+
             // The dedicated server takes no documented command-line arguments —
             // all configuration lives in enshrouded_server.json.
-            var args = Config.StartupParams.Trim();
+            // An explicit null in server_config.json defeats the property initializer,
+            // so don't dereference StartupParams directly.
+            var args = Config.StartupParams?.Trim() ?? "";
             AppLogger.Info($"Launching: {serverExe}{(args.Length > 0 ? " " + args : "")}");
 
             var process = Process.Start(new ProcessStartInfo

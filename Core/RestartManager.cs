@@ -72,6 +72,27 @@ public class RestartManager
         AppLogger.Info($"Next restart scheduled: {NextRestart:yyyy-MM-dd HH:mm:ss}");
     }
 
+    /// <summary>
+    /// Replaces the loop with a fresh one on an explicit retry delay. Only used
+    /// when a restart we initiated failed: StopAsync already cancelled our token,
+    /// so the current loop is unusable, but nothing spawned a successor.
+    /// </summary>
+    private void Rearm(TimeSpan retryIn)
+    {
+        if (!_server.Config.AutoRestart)
+        {
+            NextRestart = null;
+            return;
+        }
+
+        _scheduledIntervalHours = _server.Config.RestartInterval;
+        NextRestart = DateTime.Now.Add(retryIn);
+        _cts = new CancellationTokenSource();
+        var token = _cts.Token;
+        _loopTask = Task.Run(() => RunLoopAsync(token));
+        AppLogger.Info($"Restart retry scheduled: {NextRestart:yyyy-MM-dd HH:mm:ss}");
+    }
+
     private async Task RunLoopAsync(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
@@ -86,35 +107,57 @@ public class RestartManager
                 }
 
                 var now = DateTime.Now;
-                var warningTime = TimeSpan.FromMinutes(_server.Config.RestartWarningMinutes);
+
+                // A warning window at or beyond the interval would trip on the very
+                // first pass and push the restart out by the whole window, so cap it
+                // just under the interval.
+                var intervalMinutes = Math.Max(1, _scheduledIntervalHours * 60);
+                var warningMinutes  = Math.Clamp(_server.Config.RestartWarningMinutes, 0, intervalMinutes - 1);
+                var warningTime     = TimeSpan.FromMinutes(warningMinutes);
 
                 if (NextRestart.HasValue && now >= NextRestart.Value - warningTime)
                 {
-                    AppLogger.Info($"Server restart in {_server.Config.RestartWarningMinutes} minute(s)...");
-                    await DiscordService.SendAsync(_server.Config.DiscordStatusWebhookUrl,
-                        $"⚠️ **{_server.Config.ServerName}** — Server restarting in {_server.Config.RestartWarningMinutes} minute(s).");
+                    if (warningMinutes > 0)
+                    {
+                        AppLogger.Info($"Server restart in {warningMinutes} minute(s)...");
+                        await DiscordService.SendAsync(_server.Config.DiscordStatusWebhookUrl,
+                            $"⚠️ **{_server.Config.ServerName}** — Server restarting in {warningMinutes} minute(s).");
 
-                    // Wait out the warning period
-                    await Task.Delay(warningTime, ct);
+                        // Wait out the warning period
+                        await Task.Delay(warningTime, ct);
 
-                    if (ct.IsCancellationRequested) break;
+                        if (ct.IsCancellationRequested) break;
+                    }
 
                     AppLogger.Info("Executing scheduled restart...");
                     bool ok = await _server.RestartAsync();
 
-                    // RestartAsync cycles this manager (StopAsync cancels our token,
-                    // StartAsync spawns a replacement loop that owns the schedule now).
-                    if (ct.IsCancellationRequested) break;
-
+                    // Either way our token is now cancelled — StopAsync calls Stop() on
+                    // us on its way through — so this loop cannot continue past here.
                     if (ok)
                     {
-                        ScheduleNext();
+                        // StartAsync called Start(), which spawned a replacement loop
+                        // that owns the schedule from here on.
+                        break;
+                    }
+
+                    // The restart failed, so StartAsync never reached Start() and no
+                    // replacement loop exists. Re-arm with a fresh token rather than
+                    // letting the manager die silently for the rest of the session.
+                    if (_server.IsRunning())
+                    {
+                        AppLogger.Error("Scheduled restart failed but the server is still up — retrying in 5 minutes.");
+                        // Include the warning window so players still get the full
+                        // heads-up before the retry rather than an immediate one.
+                        Rearm(TimeSpan.FromMinutes(5) + warningTime);
                     }
                     else
                     {
-                        AppLogger.Error("Scheduled restart failed — retrying in 5 minutes.");
-                        NextRestart = DateTime.Now.AddMinutes(5);
+                        AppLogger.Error("Scheduled restart failed and the server is down — automatic restarts " +
+                                        "stopped. Check the server logs, then start it manually.");
+                        NextRestart = null;
                     }
+                    break;
                 }
 
                 await Task.Delay(TimeSpan.FromSeconds(30), ct);
