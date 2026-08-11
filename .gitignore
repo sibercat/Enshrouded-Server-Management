@@ -3,4 +3,5 @@ obj/
 publish/
 *.user
 .vs/
+.vscode/
 server_config.json

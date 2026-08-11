@@ -32,6 +32,9 @@ dotnet publish -c Release -r win-x64 --no-self-contained -o publish/
 ## Features
 
 - Start / Stop / Restart / Update the Enshrouded dedicated server
+- Installs the server for you — Start offers a SteamCMD install if the server files are missing
+- Waits for the server to actually be joinable before reporting it started
+  (status shows `Loading...` while the world loads, green once players can connect)
 - Live CPU and memory monitoring
 - Auto-backup on a configurable interval with automatic old-backup cleanup
 - Auto-restart on a configurable schedule
@@ -69,6 +72,10 @@ EnshroudedServer\
   generates a random one when the server starts (visible in Settings → User Groups).
 - The dedicated server takes no command-line arguments; all configuration is written to
   `enshrouded_server.json` before each start.
+- A leftover top-level `"password"` (the pre-Update-2 format) is removed automatically.
+  The Enshrouded server turns that entry into a hidden `default` user group with
+  Friend-level access that this manager cannot show or manage — set access up under
+  Settings → User Groups instead.
 
 ## GitHub
 
